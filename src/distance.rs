@@ -55,7 +55,7 @@ impl DistanceMetrics for CosineDistance {
             b_magnitude += b[i] * b[i];
         }
 
-        let similarity = dot_product / a_magnitude.sqrt() * b_magnitude.sqrt();
+        let similarity = dot_product / (a_magnitude.sqrt() * b_magnitude.sqrt());
         1.0 - similarity
     }
 }
