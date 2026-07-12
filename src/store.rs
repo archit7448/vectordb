@@ -1,4 +1,6 @@
-use std::cmp::Ordering;
+use std::{cmp::Ordering, collections::BinaryHeap};
+
+use crate::distance::DistanceMetrics;
 
 #[derive(Debug, Clone)]
 pub struct SearchResult {
@@ -99,6 +101,31 @@ impl VectorStore {
             .filter(|&(_, &deleted)| !deleted)
             .map(|(&id, _)| id)
     }
+
+    pub fn search(
+        &self,
+        query: &[f32],
+        k: usize,
+        metric: &dyn DistanceMetrics,
+    ) -> Vec<SearchResult> {
+        let mut heap: BinaryHeap<SearchResult> = BinaryHeap::new();
+
+        for i in 0..self.idx_to_id.len() {
+            if self.deleted[i] {
+                continue;
+            }
+            let vector_in_store = &self.data[self.dim * i..self.dim * (i + 1)];
+            let distance = metric.distance(query, vector_in_store);
+            let id = self.idx_to_id[i];
+            if heap.len() < k {
+                heap.push(SearchResult { id, distance });
+            } else if distance < heap.peek().unwrap().distance {
+                heap.pop();
+                heap.push(SearchResult { id, distance });
+            }
+        }
+        heap.into_sorted_vec()
+    }
 }
 
 #[cfg(test)]
@@ -119,7 +146,7 @@ mod tests {
     fn test_dimension_mismatch_returns_err() {
         let mut store = VectorStore::new(2);
         assert_eq!(
-            store.insert(5, &[1.0, 2.0,3.0]),
+            store.insert(5, &[1.0, 2.0, 3.0]),
             Err(StoreError::DimensionMismatch {
                 expected: 2,
                 got: 3
@@ -160,5 +187,49 @@ mod tests {
         store.insert(2, &[3.0, 4.0]).unwrap();
         store.delete(7).unwrap();
         assert_eq!(store.len(), 2)
+    }
+
+    #[test]
+    fn test_search_returns_closest_first() {
+        let mut store = VectorStore::new(2);
+        store.insert(1, &[0.0, 0.0]).unwrap();
+        store.insert(2, &[1.0, 0.0]).unwrap(); // distance 1 from query
+        store.insert(3, &[5.0, 0.0]).unwrap(); // distance 5 from query
+        store.insert(4, &[2.0, 0.0]).unwrap(); // distance 2 from query
+
+        let query = [0.0, 0.0];
+        let metric = crate::distance::EuclideanDistance;
+        let results = store.search(&query, 2, &metric);
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].id, 1); // itself, distance 0
+        assert_eq!(results[1].id, 2); // distance 1
+    }
+
+    #[test]
+    fn test_search_skips_deleted() {
+        let mut store = VectorStore::new(2);
+        store.insert(1, &[0.0, 0.0]).unwrap();
+        store.insert(2, &[1.0, 0.0]).unwrap();
+        store.delete(1).unwrap();
+
+        let query = [0.0, 0.0];
+        let metric = crate::distance::EuclideanDistance;
+        let results = store.search(&query, 5, &metric);
+
+        assert_eq!(results[0].id, 2)
+    }
+
+    #[test]
+    fn test_search_k_larger_than_store() {
+        let mut store = VectorStore::new(2);
+        store.insert(1, &[0.0, 0.0]).unwrap();
+        store.insert(2, &[1.0, 0.0]).unwrap();
+
+        let query = [0.0, 0.0];
+        let metric = crate::distance::EuclideanDistance;
+        let results = store.search(&query, 100, &metric);
+
+        assert_eq!(results.len(), 2)
     }
 }
