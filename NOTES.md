@@ -105,3 +105,55 @@ next time instead of re-deriving it inline.
   instead takes the *address* of the place — always fixed-size, never moves the
   underlying data. This is why `&data[a..b]` compiles and `data[a..b]` alone
   doesn't.
+
+---
+
+## Recall@k harness (Phase 2, issue #7) — 2026-07-16
+
+### Why this exists before any approximate index
+This is the ground-truth oracle. Brute-force `store.search` is exact, so its
+top-k *is* the correct answer. `recall_at_k` measures how much of that correct
+answer an approximate index (IVF/HNSW/PQ, later) actually found:
+`|approx_ids ∩ truth_ids| / |truth_ids|`. Recall is trivially 1.0 for brute
+force now — the point is to build and trust the measuring stick *before* I have
+anything approximate to measure, so every later phase can be compared honestly.
+
+### Two design decisions I made and can defend
+- **Compare by id, not distance.** Distances tie and float-compare badly; the
+  question recall asks is purely "is this id in the true answer set," so it's a
+  set intersection over ids. A `HashSet<u64>` of the true ids, then count how
+  many approx ids hit it.
+- **Denominator is `min(k, truth.len())`, not `k`.** If the store has fewer than
+  `k` live vectors, the true answer set is smaller than `k`, and dividing by `k`
+  would cap recall below 1.0 even for a perfect match. Using `truth_ids.len()`
+  keeps recall in [0,1] and means "perfect = found everything findable." Empty
+  truth returns 1.0 (nothing to miss) — documented on the function.
+
+`mean_recall_at_k` averages over many queries: single-query recall is noise
+(a query near a cluster boundary behaves nothing like one in the middle), so the
+number that actually describes an index is the average over a query set. That's
+the function Phase 3 will call to draw the recall-vs-`nprobe` curve.
+
+### Bug I shipped in the first draft — wrong loop guard
+The bounds guard read `if i >= k { break }` inside `for i in 0..k` — dead code,
+since `i` is always `< k` there. It was *meant* to be `if i >= truth.len()`. So
+whenever `truth` had fewer than `k` elements, `truth[i]` panicked (index out of
+bounds). None of my first tests exercised truth-shorter-than-k, so it passed
+green while being broken. Lesson: an acceptance criterion only protects you if a
+test actually drives that path — I added `truth_shorter_than_k` and *then* the
+bug showed. Also a reminder to guard against the *right* length: the `approx`
+loop correctly used `approx.len()`; I just didn't mirror it on the truth loop.
+
+### Rust I learned
+- **Integer vs float division is decided by operand type, not result type.**
+  `(count / k) as f32` does integer division *first* (3/4 → 0), then casts the 0.
+  The fraction is gone before the cast runs. Must cast the operands up front:
+  `count as f32 / k as f32`. Rule I'm keeping: **cast the inputs, not the
+  output.**
+- **`HashSet` vs `HashMap`**: for a membership test ("is this id one of the true
+  ones?") there's no value to store, only keys — `HashSet` is the honest tool.
+  `HashMap<_, bool>` would work but signals "I have a value" when I don't.
+- Still writing explicit `for` loops over iterator chains on purpose — I can
+  trace them, which matters more than looking idiomatic. Plan: once a loop is
+  green, try rewriting it as a chain as a learning rep, keep whichever I
+  understand.
