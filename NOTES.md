@@ -157,3 +157,79 @@ loop correctly used `approx.len()`; I just didn't mirror it on the truth loop.
   trace them, which matters more than looking idiomatic. Plan: once a loop is
   green, try rewriting it as a chain as a learning rep, keep whichever I
   understand.
+
+---
+
+## Box-Muller / gaussian data generation (Phase 2, dataset generator) — 2026-07-16
+
+Learned this before coding the synthetic dataset generator, because the
+[DECIDE] was hand-roll Box-Muller vs pull in `rand_distr`. Chose hand-roll —
+the point of this project is understanding the primitives, and this one I can
+now actually derive.
+
+### Why gaussian clusters at all
+Real embeddings are clustered: similar things (two dog photos) land near each
+other, so data forms blobs around centers — dense in the middle, sparse at the
+edges. Uniform-random test data has no structure (everything equidistant from
+everything), and IVF/HNSW are only clever *because* data is clustered — so
+benchmarking on uniform data gives meaningless numbers. The generator makes
+blobs: pick k centers, each point = center + bell-curve noise * spread.
+
+Why bell curve specifically: it's what "many small random influences summed"
+converges to (Central Limit Theorem — traced it with 4 coin flips: ways to end
+at 0/±2/±4 are 6/4/1, middle is common because many orderings reach it,
+extremes rare because they need every step to conspire). Real embedding noise
+is exactly many small influences, so gaussian is the *right* fake, not just a
+convenient one.
+
+### Box-Muller — how I understand it now (my words)
+The computer only gives flat random numbers in [0,1] (every value equally
+likely). I need bell-curve numbers (values near 0 common, far values rare).
+You can't just use the flat number as the output — that produces the wrong
+frequencies. The trick:
+
+- The bell-curve height formula `e^(−x²/2)` is a **wish list**: how often each
+  value should occur (x=0 → 1.0, x=1 → 0.61, x=2 → 0.14, x=3 → 0.01).
+- From the wish list you build a **zone map**: accumulate popularity into the
+  0-to-1 line, so each value owns a zone whose *width* = its popularity.
+  (Discrete version: popularities 5/3/2 → zones [0,0.5)/[0.5,0.8)/[0.8,1.0);
+  a flat u lands in wide zones often — wish list honored.)
+- My flat random number u is a **position on that accumulated-area line**, NOT
+  a height. I ask the backward question: "accumulation reached u at which x?"
+- For the radius, accumulated area up to R is `1 − e^(−R²/2)` (R=1 → 0.39,
+  R=2 → 0.86, R=3 → 0.989). Solving backward for R, R is trapped as a power
+  of e — and recovering a power is exactly what log does (log₂8=3 recovers
+  the 3 from 2³). Hence the `ln`:
+  `u = 1 − e^(−R²/2)` → `R = √(−2·ln(1−u))` → written as `√(−2·ln u)` since
+  1−u is just as flat as u.
+
+So: `ln` is in the formula because the bell curve is built from an exponential,
+and the value I want is trapped in its exponent. Not magic, bookkeeping.
+
+Gotcha to handle in code: u=0 makes `ln(0) = −∞` → radius blows up. Sample u
+from (0,1] or guard it; needs a test.
+
+### cos / sin — what finally clicked (my words)
+I was confused because I thought cos and sin were building two *separate*
+vectors in different directions and then combining them. They're not. There is
+**one** random dart thrown from the center. Box-Muller gives me that dart as
+"distance R + direction θ". But my vector's dimensions are axes (dim 0 = how far
+along axis 0, dim 1 = how far along axis 1), so I need the dart in axis form,
+not distance+direction form. cos and sin are just the right-triangle translator:
+`R·cos(θ)` = how far the dart went along axis 0, `R·sin(θ)` = along axis 1. Same
+single dart, split into its two axis components. That's why one Box-Muller call
+fills exactly two dimensions, and why the noise can be negative (a pure radius
+is always positive — the direction/angle supplies the sign that lets the point
+move left/right/down, not just "away").
+
+### spread — the difficulty knob
+`new[d] = center[d] + z * spread`. `z` is the raw bell-curve noise (direction +
+shape); `spread` is a volume knob on how *far* the point wanders from its center.
+Small spread → tight dense blob (points cling to center); large spread → wide
+diffuse blob. It does NOT stretch the vector's length — it scales the cloud's
+radius. Why I care: spread controls how hard the search problem is. Tight,
+well-separated clusters are easy for IVF/HNSW (flattering benchmark numbers);
+large spread makes clusters overlap and blur, so queries near boundaries get
+ambiguous and recall drops. So spread is my difficulty dial for benchmarking,
+not cosmetic — I'll turn it up in Phase 3 to see how the index degrades on hard
+data (real embeddings are messy, not neatly separated).
