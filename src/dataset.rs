@@ -1,6 +1,6 @@
 use std::f32::consts::PI;
 
-struct RNG {
+pub struct RNG {
     seed: u64,
 }
 

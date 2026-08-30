@@ -102,6 +102,20 @@ impl VectorStore {
             .map(|(&id, _)| id)
     }
 
+    pub fn dim(&self) -> usize {
+        self.dim
+    }
+
+    pub fn vector_at(&self, idx: usize) -> &[f32] {
+        &self.data[idx * self.dim..(idx + 1) * self.dim]
+    }
+
+    pub fn iter_live(&self) -> impl Iterator<Item = (u64, &[f32])> + '_ {
+        (0..self.idx_to_id.len())
+            .filter(move |&i| !self.deleted[i])
+            .map(move |i| (self.idx_to_id[i], self.vector_at(i)))
+    }
+
     pub fn search(
         &self,
         query: &[f32],
@@ -231,5 +245,108 @@ mod tests {
         let results = store.search(&query, 100, &metric);
 
         assert_eq!(results.len(), 2)
+    }
+
+    #[test]
+    fn test_dim_returns_configured_dim() {
+        let store = VectorStore::new(3);
+        assert_eq!(store.dim(), 3);
+    }
+
+    #[test]
+    fn test_vector_at_returns_slot_slice() {
+        let mut store = VectorStore::new(2);
+        store.insert(10, &[1.0, 2.0]).unwrap();
+        store.insert(20, &[3.0, 4.0]).unwrap();
+
+        // physical slots, in insertion order
+        assert_eq!(store.vector_at(0), &[1.0, 2.0][..]);
+        assert_eq!(store.vector_at(1), &[3.0, 4.0][..]);
+    }
+
+    #[test]
+    fn test_vector_at_ignores_tombstones() {
+        // vector_at is unchecked by contract: it returns the raw slot even if
+        // deleted. Liveness filtering is the caller's job (get, iter_live).
+        let mut store = VectorStore::new(2);
+        store.insert(10, &[1.0, 2.0]).unwrap();
+        store.delete(10).unwrap();
+
+        assert_eq!(store.get(10), None);
+        assert_eq!(store.vector_at(0), &[1.0, 2.0][..]);
+    }
+
+    #[test]
+    fn test_iter_live_skips_deleted_and_is_ordered() {
+        let mut store = VectorStore::new(2);
+        store.insert(10, &[1.0, 2.0]).unwrap();
+        store.insert(20, &[3.0, 4.0]).unwrap();
+        store.insert(30, &[5.0, 6.0]).unwrap();
+        store.delete(20).unwrap();
+
+        let live: Vec<_> = store.iter_live().collect();
+        assert_eq!(live.len(), 2);
+        assert_eq!(live[0], (10, &[1.0, 2.0][..]));
+        assert_eq!(live[1], (30, &[5.0, 6.0][..]));
+    }
+
+    #[test]
+    fn test_iter_live_is_empty_when_store_is_empty() {
+        let store = VectorStore::new(2);
+        assert_eq!(store.iter_live().count(), 0);
+    }
+
+    #[test]
+    fn test_iter_live_is_empty_when_all_deleted() {
+        let mut store = VectorStore::new(2);
+        store.insert(10, &[1.0, 2.0]).unwrap();
+        store.insert(20, &[3.0, 4.0]).unwrap();
+        store.delete(10).unwrap();
+        store.delete(20).unwrap();
+
+        assert_eq!(store.iter_live().count(), 0);
+    }
+
+    #[test]
+    fn test_iter_live_count_matches_len() {
+        let mut store = VectorStore::new(2);
+        for i in 0..10u64 {
+            store.insert(i, &[i as f32, i as f32]).unwrap();
+        }
+        store.delete(3).unwrap();
+        store.delete(7).unwrap();
+
+        assert_eq!(store.iter_live().count(), store.len());
+    }
+
+    #[test]
+    fn test_iter_live_order_is_stable_across_calls() {
+        // k-means determinism depends on this: the same seed must visit points
+        // in the same order every run. Physical index order gives that;
+        // HashMap iteration order would not.
+        let mut store = VectorStore::new(2);
+        for i in 0..50u64 {
+            store.insert(i * 7, &[i as f32, 0.0]).unwrap();
+        }
+        store.delete(21).unwrap();
+
+        let first: Vec<u64> = store.iter_live().map(|(id, _)| id).collect();
+        for _ in 0..5 {
+            let again: Vec<u64> = store.iter_live().map(|(id, _)| id).collect();
+            assert_eq!(first, again);
+        }
+    }
+
+    #[test]
+    fn test_iter_live_agrees_with_get() {
+        let mut store = VectorStore::new(2);
+        store.insert(10, &[1.0, 2.0]).unwrap();
+        store.insert(20, &[3.0, 4.0]).unwrap();
+        store.insert(30, &[5.0, 6.0]).unwrap();
+        store.delete(20).unwrap();
+
+        for (id, vector) in store.iter_live() {
+            assert_eq!(store.get(id), Some(vector));
+        }
     }
 }
